@@ -865,6 +865,19 @@ async function fetchSlot(env, q) {
   return out;
 }
 
+/* Fetch a period slot with its own cache. Past/comparison slots (prev, yoy)
+   rarely change, so they get a long TTL; the live current slot a short one. */
+async function fetchSlotCached(env, q, tz, rollover, ttl, force) {
+  const key = 'slotcache:' + q.from + ':' + q.to + '|' + tz + '|' + rollover;
+  if (!force && env.TOKENS) {
+    const c = await env.TOKENS.get(key);
+    if (c) { try { return JSON.parse(c); } catch (e) {} }
+  }
+  const out = await fetchSlot(env, q);
+  if (env.TOKENS) { try { await env.TOKENS.put(key, JSON.stringify(out), { expirationTtl: ttl }); } catch (e) {} }
+  return out;
+}
+
 const METRICS_CACHE_TTL = 120; /* seconds: brief cache for live provider data */
 
 async function apiMetrics(env, url) {
@@ -903,9 +916,9 @@ async function apiMetrics(env, url) {
     /* Fetch the three period slots AND the trend CONCURRENTLY rather than one
        after another - each is an independent set of provider calls, so running
        them in parallel roughly quarters the wall time (the slow-load fix). */
-    const _curP = fetchSlot(env, { ...base, ...cur });
-    const _prevP = prev ? fetchSlot(env, { ...base, ...prev }) : Promise.resolve(null);
-    const _yoyP = yoy ? fetchSlot(env, { ...base, ...yoy }) : Promise.resolve(null);
+    const _curP = fetchSlotCached(env, { ...base, ...cur }, tz, rollover, 300, force);
+    const _prevP = prev ? fetchSlotCached(env, { ...base, ...prev }, tz, rollover, 21600, force) : Promise.resolve(null);
+    const _yoyP = yoy ? fetchSlotCached(env, { ...base, ...yoy }, tz, rollover, 21600, force) : Promise.resolve(null);
 
     const _trendP = (async () => {
       if (!trend) return null;
