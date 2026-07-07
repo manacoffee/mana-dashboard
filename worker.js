@@ -58,43 +58,161 @@ import dashboardHtml from './dashboard.html';
    secret; if the owner uploads by hand, that same value is their upload code. */
 const ADAPTERS = {
 
-  /* >>> ADAPTER 1: ACCOUNTING (connect this FIRST - it feeds most of the board)
-     Contract:
-       auth: 'oauth' with the oauth{} block filled, or 'token' for a pasted key
-       status(env, h)        -> { connected, org, sandbox, lastSync }
-       fetchRange(env, h, q) -> { revenue, cogs, wagesSuper, overheads }
-                                 (numbers, ex GST/sales tax, for q.from..q.to
-                                  inclusive, dates in the venue's books)
-       fetchMonthly(env, h, q)-> { months:['YYYY-MM',...], revenue:[...],
-                                   cogs:[...], wagesSuper:[...], overheads:[...] }
-                                 (align arrays to months; null where no data)
-     Map the owner's P&L faithfully: Revenue/Income section (trading income
-     only - Other Income excluded), Cost of Sales section, wage + super
-     accounts, Operating Expenses less wages/super. Do not re-categorise
-     their books. See kpi-spec.md.
-     Example (Xero): oauth with tokenAuth:'basic' (the token endpoint wants
-     HTTP Basic client auth), scopes 'offline_access
-     accounting.reports.profitandloss.read', P&L report endpoint, org name
-     from the connections endpoint, sandbox = tenant name contains
-     'Demo Company'. Secrets: ACCOUNTING_CLIENT_ID, ACCOUNTING_CLIENT_SECRET.
-  */
+  /* >>> ADAPTER 1: ACCOUNTING - Xero (wired for Mana Coffee)
+     OAuth2 auth-code, granular P&L scope, HTTP Basic token auth. Pulls the
+     Profit and Loss report; maps Income (trading only), Cost of Sales,
+     wages+super (keyword-matched, owner-confirmed), and Operating Expenses.
+     All figures ex-GST, per kpi-spec.md. Secrets: ACCOUNTING_CLIENT_ID,
+     ACCOUNTING_CLIENT_SECRET. */
   accounting: {
-    configured: false,
-    auth: null, /* 'oauth' | 'token' */
+    configured: true,
+    auth: 'oauth',
     oauth: {
-      /* Example (Xero) - fill these when you wire the adapter:
-         authorizeUrl: 'https://login.xero.com/identity/connect/authorize',
-         tokenUrl: 'https://identity.xero.com/connect/token',
-         scopes: 'offline_access accounting.reports.profitandloss.read',
-         clientIdSecret: 'ACCOUNTING_CLIENT_ID',
-         clientSecretSecret: 'ACCOUNTING_CLIENT_SECRET',
-         tokenAuth: 'basic'   // Xero's token endpoint wants HTTP Basic client auth
-                              // (client_secret_basic). Use 'post' only for providers
-                              // that expect client_id/secret in the form body. */
+      authorizeUrl: 'https://login.xero.com/identity/connect/authorize',
+      tokenUrl: 'https://identity.xero.com/connect/token',
+      scopes: 'offline_access accounting.reports.profitandloss.read accounting.settings.read',
+      clientIdSecret: 'ACCOUNTING_CLIENT_ID',
+      clientSecretSecret: 'ACCOUNTING_CLIENT_SECRET',
+      tokenAuth: 'basic'
     },
-    async status(env, h) { return { connected: false }; },
-    async fetchRange(env, h, q) { throw new NotConfigured('accounting'); },
-    async fetchMonthly(env, h, q) { throw new NotConfigured('accounting'); }
+
+    /* Wage/super account-name keywords. Proposes; the owner confirms the exact
+       list at reconciliation. Deliberately excludes over-matches like
+       "employee amenities" / "staff training" / "staff amenities". */
+    WAGE_RE: /wages|salaries|superannuation|\bsuper\b|payroll|annual leave|long service|workcover|work cover/i,
+    NONWAGE_RE: /amenities|training|uniform|recruit|welfare|gift/i,
+
+    async _tenant(env, h) {
+      /* Resolve + cache the Xero tenantId and org name from /connections. */
+      const tok = await h.getTokens();
+      if (tok && tok.tenantId) return { id: tok.tenantId, name: tok.tenantName || null };
+      const conns = await h.fetchJson('https://api.xero.com/connections', {
+        headers: { 'Accept': 'application/json' }
+      });
+      const c = Array.isArray(conns) ? conns.find((x) => x.tenantType === 'ORGANISATION') || conns[0] : null;
+      if (!c) { const e = new Error('no tenant'); e.status = 401; throw e; }
+      const fresh = await h.getTokens();
+      if (fresh) { fresh.tenantId = c.tenantId; fresh.tenantName = c.tenantName || null; await h.saveTokens(fresh); }
+      return { id: c.tenantId, name: c.tenantName || null };
+    },
+
+    async status(env, h) {
+      const tok = await h.getTokens();
+      if (!tok || !tok.access_token) return { connected: false };
+      const t = await this._tenant(env, h);
+      const name = t.name || '';
+      return {
+        connected: true,
+        org: name || null,
+        sandbox: /demo company/i.test(name),
+        lastSync: null
+      };
+    },
+
+    /* --- P&L fetch + parse ------------------------------------------------ */
+    async _pandl(env, h, fromDate, toDate, extraParams) {
+      const t = await this._tenant(env, h);
+      const p = new URLSearchParams({ fromDate: fromDate, toDate: toDate });
+      if (extraParams) for (const k in extraParams) p.set(k, extraParams[k]);
+      const url = 'https://api.xero.com/api.xro/2.0/Reports/ProfitAndLoss?' + p.toString();
+      return h.fetchJson(url, {
+        headers: { 'Accept': 'application/json', 'Xero-Tenant-Id': t.id }
+      });
+    },
+
+    /* Walk the report rows. Returns per-column arrays so multi-period reports
+       (trend) and single-period reports share one parser. */
+    _parse(report) {
+      const rep = report && report.Reports && report.Reports[0];
+      if (!rep || !Array.isArray(rep.Rows)) return null;
+      /* number of amount columns = header cells after the first label cell */
+      let ncol = 0;
+      const header = rep.Rows.find((r) => r.RowType === 'Header');
+      if (header && Array.isArray(header.Cells)) ncol = Math.max(0, header.Cells.length - 1);
+      if (ncol < 1) ncol = 1;
+      const zeros = () => new Array(ncol).fill(0);
+      const out = { revenue: zeros(), cogs: zeros(), wagesSuper: zeros(), overheads: zeros() };
+      const num = (s) => { const v = parseFloat(String(s == null ? '' : s).replace(/,/g, '')); return isFinite(v) ? v : 0; };
+      const self = this;
+
+      function amounts(cells) {
+        const a = zeros();
+        for (let c = 0; c < ncol; c++) { const cell = cells[c + 1]; a[c] = cell ? num(cell.Value) : 0; }
+        return a;
+      }
+      function add(target, cells) { const a = amounts(cells); for (let c = 0; c < ncol; c++) target[c] += a[c]; }
+
+      for (const section of rep.Rows) {
+        if (section.RowType !== 'Section' || !Array.isArray(section.Rows)) continue;
+        const title = (section.Title || '').toLowerCase();
+        /* Order matters: test Cost of Sales BEFORE Income (a "Cost of Sales"
+           title also contains "sales"), and exclude Other Income from revenue. */
+        const isCOS = /cost of (sales|goods)|cogs|direct cost/.test(title);
+        const isOtherIncome = /other income/.test(title);
+        const isIncome = !isCOS && !isOtherIncome && /income|revenue|sales|trading|turnover/.test(title);
+        const isOpex = !isCOS && !isIncome && !isOtherIncome && /operating expense|expenses|overhead|administration|less operating/.test(title);
+        for (const row of section.Rows) {
+          if (row.RowType !== 'Row' || !Array.isArray(row.Cells)) continue;
+          const label = (row.Cells[0] && row.Cells[0].Value) || '';
+          if (isIncome) { add(out.revenue, row.Cells); }
+          else if (isCOS) { add(out.cogs, row.Cells); }
+          else if (isOpex) {
+            const isWage = self.WAGE_RE.test(label) && !self.NONWAGE_RE.test(label);
+            if (isWage) add(out.wagesSuper, row.Cells);
+            else add(out.overheads, row.Cells);
+          }
+        }
+      }
+      return { ncol: ncol, out: out };
+    },
+
+    async fetchRange(env, h, q) {
+      const report = await this._pandl(env, h, q.from, q.to);
+      const parsed = this._parse(report);
+      if (!parsed) throw new Error('could not parse P&L');
+      const o = parsed.out;
+      return {
+        revenue: o.revenue[0],
+        cogs: o.cogs[0],
+        wagesSuper: o.wagesSuper[0],
+        overheads: o.overheads[0]
+      };
+    },
+
+    async fetchMonthly(env, h, q) {
+      /* Build month buckets fromMonth..toMonth; Xero caps `periods` at 12, so
+         chunk into <=12-month calls with timeframe=MONTH and stitch. */
+      const months = [];
+      let [y, m] = q.fromMonth.split('-').map(Number);
+      const [ey, em] = q.toMonth.split('-').map(Number);
+      while (y < ey || (y === ey && m <= em)) {
+        months.push(y + '-' + String(m).padStart(2, '0'));
+        m++; if (m > 12) { m = 1; y++; }
+        if (months.length > 60) break;
+      }
+      const res = { months: months, revenue: [], cogs: [], wagesSuper: [], overheads: [] };
+      const lastDay = (yy, mm) => new Date(Date.UTC(yy, mm, 0)).getUTCDate();
+      for (let i = 0; i < months.length; i += 12) {
+        const chunk = months.slice(i, i + 12);
+        const [fy, fm] = chunk[0].split('-').map(Number);
+        const [ly, lm] = chunk[chunk.length - 1].split('-').map(Number);
+        const fromDate = fy + '-' + String(fm).padStart(2, '0') + '-01';
+        const toDate = ly + '-' + String(lm).padStart(2, '0') + '-' + String(lastDay(ly, lm)).padStart(2, '0');
+        const report = await this._pandl(env, h, fromDate, toDate, { timeframe: 'MONTH', periods: String(chunk.length) });
+        const parsed = this._parse(report);
+        if (!parsed) { for (let k = 0; k < chunk.length; k++) { res.revenue.push(null); res.cogs.push(null); res.wagesSuper.push(null); res.overheads.push(null); } continue; }
+        const o = parsed.out;
+        /* Xero returns period columns oldest->newest matching chunk order. If
+           column count differs, pad/truncate defensively. */
+        for (let k = 0; k < chunk.length; k++) {
+          res.revenue.push(k < parsed.ncol ? o.revenue[k] : null);
+          res.cogs.push(k < parsed.ncol ? o.cogs[k] : null);
+          res.wagesSuper.push(k < parsed.ncol ? o.wagesSuper[k] : null);
+          res.overheads.push(k < parsed.ncol ? o.overheads[k] : null);
+        }
+      }
+      return res;
+    }
   },
 
   /* >>> ADAPTER 2: POS
