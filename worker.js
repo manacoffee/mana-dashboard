@@ -255,13 +255,20 @@ const ADAPTERS = {
 
       /* find the header row: the first row containing a recognisable date header
          OR a count header. Scan the first 15 rows (exports often have a preamble). */
-      const DATE_HDR = /^(date|day|business date|trading date|datetime|date\/time|sale closed date|closed date|receipt date|sale date)$/i;
-      const COUNT_HDR = /(^sales$|receipts?|transactions?|sales count|no\.? of sales|covers|orders?|tickets?|checks?|guests?|# ?sales|qty|quantity|count)/i;
+      /* Date column: exact known headers only (avoid matching e.g. "Sale Closed Date"
+         as a count). */
+      const DATE_HDR = /^(sale closed date|closed date|business date|trading date|sale date|receipt date|date\/time|datetime|date|day)$/i;
+      /* Count column: prefer an exact "Sales"/"Receipts"/"Transactions"/"Covers"
+         header. Deliberately EXCLUDE anything with "value", "avg", "average",
+         "total", "$", "amount", "tax", "spend", or "date" - those are money or the
+         date, never the transaction count. */
+      const COUNT_EXCLUDE = /value|avg|average|total|amount|tax|spend|\$|net|gross|date/i;
+      const COUNT_HDR = /^(sales|receipts?|transactions?|covers|orders?|tickets?|checks?|no\.? of sales|sales count|# ?sales|transaction count|guest count)$/i;
       let hi = -1, dateCol = -1, countCol = -1;
       for (let i = 0; i < Math.min(rows.length, 15); i++) {
         const cells = rows[i].map((c) => c.trim());
         const dc = cells.findIndex((c) => DATE_HDR.test(c));
-        const cc = cells.findIndex((c) => COUNT_HDR.test(c));
+        const cc = cells.findIndex((c) => COUNT_HDR.test(c) && !COUNT_EXCLUDE.test(c));
         if (dc >= 0 && cc >= 0) { hi = i; dateCol = dc; countCol = cc; break; }
       }
       /* if we found a date col but no explicit count header, prefer a header that
