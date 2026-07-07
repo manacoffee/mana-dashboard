@@ -907,17 +907,24 @@ async function apiMetrics(env, url) {
     const _prevP = prev ? fetchSlot(env, { ...base, ...prev }) : Promise.resolve(null);
     const _yoyP = yoy ? fetchSlot(env, { ...base, ...yoy }) : Promise.resolve(null);
 
-    let _tMonths = null, _tRange = null;
     const _trendP = (async () => {
       if (!trend) return null;
-      /* Cap the trend to the most recent 12 months: the card only shows 12, and
-         asking Xero for 24+ months forces extra sequential P&L calls that can tip
-         the request into a 503. Keep the last 12 of whatever range was asked. */
-      _tMonths = monthList(trend.fromMonth, trend.toMonth);
-      _tRange = trend;
+      /* Cap the trend to the most recent 12 months (the card only shows 12). */
+      let _tMonths = monthList(trend.fromMonth, trend.toMonth);
+      let _tRange = trend;
       if (_tMonths.length > 12) {
         _tMonths = _tMonths.slice(-12);
         _tRange = { fromMonth: _tMonths[0], toMonth: _tMonths[_tMonths.length - 1] };
+      }
+      /* The trend is the SLOW part: it asks Xero to build a full year of monthly
+         P&L (several seconds at Xero's end). It barely changes day-to-day (whole
+         PAST months), so cache it on its OWN long-lived key (6h), independent of
+         the period/cur cache. This makes the yearly Xero call happen at most once
+         every 6h and be reused instantly across every period switch and reopen. */
+      const trendKey = 'trendcache:' + _tMonths[0] + ':' + _tMonths[_tMonths.length - 1] + '|' + tz + '|' + rollover;
+      if (!force && env.TOKENS) {
+        const c = await env.TOKENS.get(trendKey);
+        if (c) { try { return JSON.parse(c); } catch (e) {} }
       }
       const out = { months: _tMonths };
       await Promise.all(['accounting', 'pos'].map(async (source) => {
@@ -929,6 +936,7 @@ async function apiMetrics(env, url) {
           out[source] = alignSeries(out.months, series);
         } catch (err) { out[source] = null; }
       }));
+      if (env.TOKENS) { try { await env.TOKENS.put(trendKey, JSON.stringify(out), { expirationTtl: 21600 }); } catch (e) {} }
       return out;
     })();
 
