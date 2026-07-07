@@ -295,12 +295,13 @@ var TZ_CHOICES = {
   US: ['America/New_York','America/Chicago','America/Denver','America/Phoenix','America/Los_Angeles','Pacific/Honolulu','America/Anchorage']
 };
 var ACCENTS = [
+  { key: 'latte',  c: '#8A5A2B', dim: 'rgba(138,90,43,0.12)' },
+  { key: 'green',  c: '#1A7A3C', dim: 'rgba(26,122,60,0.12)' },
   { key: 'gold',   c: '#F2A900', dim: 'rgba(242,169,0,0.12)' },
   { key: 'teal',   c: '#0E8A6E', dim: 'rgba(14,138,110,0.12)' },
   { key: 'blue',   c: '#1A5FB4', dim: 'rgba(26,95,180,0.12)' },
   { key: 'coral',  c: '#C04B28', dim: 'rgba(192,75,40,0.12)' },
-  { key: 'purple', c: '#5C3DB0', dim: 'rgba(92,61,176,0.12)' },
-  { key: 'green',  c: '#1A7A3C', dim: 'rgba(26,122,60,0.12)' }
+  { key: 'purple', c: '#5C3DB0', dim: 'rgba(92,61,176,0.12)' }
 ];
 
 function defaultSettings() {
@@ -310,7 +311,7 @@ function defaultSettings() {
     weekStart: 1,            /* 1 = Monday */
     rolloverHour: 0,         /* sales before this hour count to the previous trading day */
     timezone: TZ_DEFAULTS[KIT_CONFIG.region] || 'Australia/Sydney',
-    accent: 'gold',
+    accent: 'latte',
     dataMode: KIT_CONFIG.startLevel === 'manual' ? 'manual' : 'live',
     targets: { cogs: 30, wage: 30, overheads: 30, profit: 10 }
   };
