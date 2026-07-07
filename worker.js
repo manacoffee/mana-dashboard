@@ -115,9 +115,18 @@ const ADAPTERS = {
       const p = new URLSearchParams({ fromDate: fromDate, toDate: toDate });
       if (extraParams) for (const k in extraParams) p.set(k, extraParams[k]);
       const url = 'https://api.xero.com/api.xro/2.0/Reports/ProfitAndLoss?' + p.toString();
-      return h.fetchJson(url, {
-        headers: { 'Accept': 'application/json', 'Xero-Tenant-Id': t.id }
-      });
+      const init = { headers: { 'Accept': 'application/json', 'Xero-Tenant-Id': t.id } };
+      /* Retry once on a transient rate-limit / unavailable (429/503) with a short
+         backoff - Xero occasionally throttles a burst of monthly calls. */
+      try {
+        return await h.fetchJson(url, init);
+      } catch (e) {
+        if (e && (e.status === 429 || e.status === 503)) {
+          await new Promise((r) => setTimeout(r, 1200));
+          return await h.fetchJson(url, init);
+        }
+        throw e;
+      }
     },
 
     /* Walk the report rows. Returns per-column arrays so multi-period reports
@@ -898,13 +907,22 @@ async function apiMetrics(env, url) {
 
     let trendOut = null;
     if (trend) {
-      trendOut = { months: monthList(trend.fromMonth, trend.toMonth) };
+      /* Cap the trend to the most recent 12 months: the card only shows 12, and
+         asking Xero for 24+ months forces extra sequential P&L calls that can tip
+         the request into a 503. Keep the last 12 of whatever range was asked. */
+      let _tMonths = monthList(trend.fromMonth, trend.toMonth);
+      let _tRange = trend;
+      if (_tMonths.length > 12) {
+        _tMonths = _tMonths.slice(-12);
+        _tRange = { fromMonth: _tMonths[0], toMonth: _tMonths[_tMonths.length - 1] };
+      }
+      trendOut = { months: _tMonths };
       for (const source of ['accounting', 'pos']) {
         const adapter = ADAPTERS[source];
         if (!adapter || !adapter.configured) { trendOut[source] = null; continue; }
         try {
           const h = makeHelpers(env, source);
-          const series = await adapter.fetchMonthly(env, h, { ...base, ...trend });
+          const series = await adapter.fetchMonthly(env, h, { ...base, ..._tRange });
           trendOut[source] = alignSeries(trendOut.months, series);
         } catch (err) { trendOut[source] = null; }
       }
