@@ -900,33 +900,41 @@ async function apiMetrics(env, url) {
     if (cached) { try { data = JSON.parse(cached); } catch (e) { data = null; } }
   }
   if (!data) {
-    const periods = {};
-    periods.cur = await fetchSlot(env, { ...base, ...cur });
-    periods.prev = prev ? await fetchSlot(env, { ...base, ...prev }) : null;
-    periods.yoy = yoy ? await fetchSlot(env, { ...base, ...yoy }) : null;
+    /* Fetch the three period slots AND the trend CONCURRENTLY rather than one
+       after another - each is an independent set of provider calls, so running
+       them in parallel roughly quarters the wall time (the slow-load fix). */
+    const _curP = fetchSlot(env, { ...base, ...cur });
+    const _prevP = prev ? fetchSlot(env, { ...base, ...prev }) : Promise.resolve(null);
+    const _yoyP = yoy ? fetchSlot(env, { ...base, ...yoy }) : Promise.resolve(null);
 
-    let trendOut = null;
-    if (trend) {
+    let _tMonths = null, _tRange = null;
+    const _trendP = (async () => {
+      if (!trend) return null;
       /* Cap the trend to the most recent 12 months: the card only shows 12, and
          asking Xero for 24+ months forces extra sequential P&L calls that can tip
          the request into a 503. Keep the last 12 of whatever range was asked. */
-      let _tMonths = monthList(trend.fromMonth, trend.toMonth);
-      let _tRange = trend;
+      _tMonths = monthList(trend.fromMonth, trend.toMonth);
+      _tRange = trend;
       if (_tMonths.length > 12) {
         _tMonths = _tMonths.slice(-12);
         _tRange = { fromMonth: _tMonths[0], toMonth: _tMonths[_tMonths.length - 1] };
       }
-      trendOut = { months: _tMonths };
-      for (const source of ['accounting', 'pos']) {
+      const out = { months: _tMonths };
+      await Promise.all(['accounting', 'pos'].map(async (source) => {
         const adapter = ADAPTERS[source];
-        if (!adapter || !adapter.configured) { trendOut[source] = null; continue; }
+        if (!adapter || !adapter.configured) { out[source] = null; return; }
         try {
           const h = makeHelpers(env, source);
           const series = await adapter.fetchMonthly(env, h, { ...base, ..._tRange });
-          trendOut[source] = alignSeries(trendOut.months, series);
-        } catch (err) { trendOut[source] = null; }
-      }
-    }
+          out[source] = alignSeries(out.months, series);
+        } catch (err) { out[source] = null; }
+      }));
+      return out;
+    })();
+
+    const [_cur, _prev, _yoy, _trend] = await Promise.all([_curP, _prevP, _yoyP, _trendP]);
+    const periods = { cur: _cur, prev: _prev, yoy: _yoy };
+    const trendOut = _trend;
     data = { generatedAt: new Date().toISOString(), periods: periods, trend: trendOut };
     if (env.TOKENS) {
       try { await env.TOKENS.put(cacheKey, JSON.stringify(data), { expirationTtl: METRICS_CACHE_TTL }); } catch (e) {}
