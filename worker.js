@@ -215,26 +215,74 @@ const ADAPTERS = {
     }
   },
 
-  /* >>> ADAPTER 2: POS
-     Contract:
-       status(env, h)        -> { connected, org, sandbox, lastSync }
-       fetchRange(env, h, q) -> { count }   (completed transactions only;
-                                  exclude voided/cancelled; refunds never
-                                  reduce the count; q.rollover shifts the
-                                  trading-day boundary by that many hours)
-       fetchMonthly(env, h, q)-> { months:[...], count:[...] }
-     NEVER return a dollar figure from the POS.
-     Example (Square): pasted production personal access token (secret
-     POS_API_TOKEN); sandbox sign = token only answers on
-     connect.squareupsandbox.com.
-  */
+  /* >>> ADAPTER 2: POS - Lightspeed O-Series (EXPORT mode for Mana Coffee)
+     O-Series live API is partner-approval-gated, so the transaction COUNT is fed
+     by a weekly sales-report upload (fallback ladder, per capability-matrix.md).
+     parseExport() reads a Lightspeed sales CSV and emits {date, count} day rows;
+     fetchRange/fetchMonthly read those back from the day-store. NEVER a dollar
+     figure - every money number comes from Xero. Switch to live API later by
+     adding auth:'oauth' + the O-Series realm endpoints once access is granted. */
   pos: {
-    configured: false,
+    configured: true,
+    mode: 'export',
     auth: null,
     oauth: {},
-    async status(env, h) { return { connected: false }; },
-    async fetchRange(env, h, q) { throw new NotConfigured('pos'); },
-    async fetchMonthly(env, h, q) { throw new NotConfigured('pos'); }
+
+    async status(env, h) {
+      const ls = await h.readIngested('2000-01-01', '2999-12-31');
+      const has = ls && ls.daysWithData > 0;
+      return { connected: !!has, org: has ? 'Lightspeed (weekly upload)' : null, sandbox: false, lastSync: (has && ls.lastDate) || null };
+    },
+
+    async fetchRange(env, h, q) {
+      const r = await h.readIngested(q.from, q.to);
+      if (!r || r.daysWithData === 0) throw new NotConfigured('pos');
+      return { count: Math.round(r.sums.count || 0) };
+    },
+
+    async fetchMonthly(env, h, q) {
+      const m = await h.monthlyIngested(q.fromMonth, q.toMonth);
+      return { months: m.months, count: (m.count || []).map((v) => (v == null ? null : Math.round(v))) };
+    },
+
+    /* Parse a Lightspeed sales-report CSV into [{date:'YYYY-MM-DD', count}].
+       Flexible: finds a date column and a transaction-count column by header
+       keyword, tolerant of quoting, thousands separators, and date formats. */
+    async parseExport(env, h, raw) {
+      const text = (raw && raw.text) || '';
+      const rows = _csvRows(text);
+      if (!rows.length) return [];
+
+      /* find the header row: the first row containing a recognisable date header
+         OR a count header. Scan the first 15 rows (exports often have a preamble). */
+      const DATE_HDR = /^(date|day|business date|trading date|datetime|date\/time)$/i;
+      const COUNT_HDR = /(receipts?|transactions?|sales count|no\.? of sales|covers|orders?|tickets?|checks?|guests?|# ?sales|count)/i;
+      let hi = -1, dateCol = -1, countCol = -1;
+      for (let i = 0; i < Math.min(rows.length, 15); i++) {
+        const cells = rows[i].map((c) => c.trim());
+        const dc = cells.findIndex((c) => DATE_HDR.test(c));
+        const cc = cells.findIndex((c) => COUNT_HDR.test(c));
+        if (dc >= 0 && cc >= 0) { hi = i; dateCol = dc; countCol = cc; break; }
+      }
+      /* if we found a date col but no explicit count header, prefer a header that
+         is exactly "receipts"/"transactions"/"covers"; else give up gracefully. */
+      if (hi < 0) return [];
+
+      const out = [];
+      const byDate = {};
+      for (let i = hi + 1; i < rows.length; i++) {
+        const cells = rows[i];
+        if (!cells || cells.length <= Math.max(dateCol, countCol)) continue;
+        const dISO = _toISO((cells[dateCol] || '').trim());
+        if (!dISO) continue;
+        const n = _num((cells[countCol] || '').trim());
+        if (n == null) continue;
+        /* accumulate in case the report has multiple rows per day (per site/channel) */
+        byDate[dISO] = (byDate[dISO] || 0) + n;
+      }
+      for (const d in byDate) out.push({ date: d, count: byDate[d] });
+      return out;
+    }
   },
 
   /* >>> ADAPTER 3: ROSTERING (optional - only if the owner has one)
@@ -692,6 +740,55 @@ async function apiIngest(env, request, url) {
   } catch (e) {
     return json({ error: 'parse failed', plain: 'That file couldn\u2019t be read. Check it\u2019s the right report, or show it to your AI.' }, 422);
   }
+}
+
+
+/* ---- CSV + parsing helpers for the POS export adapter ---- */
+function _csvRows(text) {
+  const out = [];
+  let row = [], field = '', inQ = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inQ) {
+      if (ch === '"') { if (text[i + 1] === '"') { field += '"'; i++; } else inQ = false; }
+      else field += ch;
+    } else {
+      if (ch === '"') inQ = true;
+      else if (ch === ',') { row.push(field); field = ''; }
+      else if (ch === '\n') { row.push(field); out.push(row); row = []; field = ''; }
+      else if (ch === '\r') { /* skip */ }
+      else field += ch;
+    }
+  }
+  if (field.length || row.length) { row.push(field); out.push(row); }
+  /* drop fully-empty rows */
+  return out.filter((r) => r.some((c) => (c || '').trim() !== ''));
+}
+function _num(s) {
+  if (s == null) return null;
+  const cleaned = String(s).replace(/[^0-9.\-]/g, '');
+  if (cleaned === '' || cleaned === '-' || cleaned === '.') return null;
+  const v = parseFloat(cleaned);
+  return isFinite(v) ? v : null;
+}
+/* Accept YYYY-MM-DD, DD/MM/YYYY, DD-MM-YYYY, D/M/YY, and "1 Jun 2026". AU order
+   (day first) is assumed for slash/dash dates - matches Lightspeed AU exports. */
+function _toISO(s) {
+  if (!s) return null;
+  s = s.trim();
+  let m = /^(\d{4})-(\d{2})-(\d{2})/.exec(s);
+  if (m) return m[1] + '-' + m[2] + '-' + m[3];
+  m = /^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})/.exec(s);
+  if (m) {
+    let d = m[1].padStart(2, '0'), mo = m[2].padStart(2, '0'), y = m[3];
+    if (y.length === 2) y = '20' + y;
+    if (parseInt(mo, 10) > 12) { const t = d; d = mo.padStart(2, '0'); mo = t.padStart(2, '0'); } /* guard if MM/DD slips in */
+    return y + '-' + mo + '-' + d;
+  }
+  const MON = { jan: '01', feb: '02', mar: '03', apr: '04', may: '05', jun: '06', jul: '07', aug: '08', sep: '09', oct: '10', nov: '11', dec: '12' };
+  m = /^(\d{1,2})\s+([A-Za-z]{3,})\s+(\d{4})/.exec(s);
+  if (m && MON[m[2].slice(0, 3).toLowerCase()]) return m[3] + '-' + MON[m[2].slice(0, 3).toLowerCase()] + '-' + m[1].padStart(2, '0');
+  return null;
 }
 
 /* ---------------- Metrics API ---------------- */
