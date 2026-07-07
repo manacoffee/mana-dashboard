@@ -255,8 +255,8 @@ const ADAPTERS = {
 
       /* find the header row: the first row containing a recognisable date header
          OR a count header. Scan the first 15 rows (exports often have a preamble). */
-      const DATE_HDR = /^(date|day|business date|trading date|datetime|date\/time)$/i;
-      const COUNT_HDR = /(receipts?|transactions?|sales count|no\.? of sales|covers|orders?|tickets?|checks?|guests?|# ?sales|count)/i;
+      const DATE_HDR = /^(date|day|business date|trading date|datetime|date\/time|sale closed date|closed date|receipt date|sale date)$/i;
+      const COUNT_HDR = /(^sales$|receipts?|transactions?|sales count|no\.? of sales|covers|orders?|tickets?|checks?|guests?|# ?sales|qty|quantity|count)/i;
       let hi = -1, dateCol = -1, countCol = -1;
       for (let i = 0; i < Math.min(rows.length, 15); i++) {
         const cells = rows[i].map((c) => c.trim());
